@@ -1,0 +1,215 @@
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+import gymnasium as gym
+import os
+import cv2
+from collections import deque
+import random
+import imageio
+from datetime import datetime
+import ale_py
+
+# Set seeds for reproducibility
+np.random.seed(42)
+tf.random.set_seed(42)
+
+# Set up environment
+env = gym.make("ALE/Breakout-v5", render_mode="rgb_array")
+num_actions = env.action_space.n
+
+# Hyperparameters
+gamma = 0.99
+epsilon = 0.6
+epsilon_min = 0.1
+epsilon_decay = 1_000_000
+batch_size = 32
+max_episodes = 10000
+max_steps_per_episode = 10000
+checkpoint_path = "checkpoint"
+recordings_path = "recordings"
+metadata_path = os.path.join(checkpoint_path, "metadata.npy")
+os.makedirs(checkpoint_path, exist_ok=True)
+os.makedirs(recordings_path, exist_ok=True)
+
+# Replay buffer
+max_memory_length = 100_000
+frame_stack_size = 4
+update_after_actions = 4
+update_target_network = 10_000
+epsilon_random_frames = 50_000
+
+# Experience buffers
+action_history = deque(maxlen=max_memory_length)
+state_history = deque(maxlen=max_memory_length)
+state_next_history = deque(maxlen=max_memory_length)
+rewards_history = deque(maxlen=max_memory_length)
+done_history = deque(maxlen=max_memory_length)
+
+# Frame preprocessing
+def preprocess_frame(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
+    normalized = resized / 255.0
+    return normalized.astype(np.float32)
+
+# Stack frames
+def stack_frames(stacked_frames, frame, is_new_episode):
+    processed = preprocess_frame(frame)
+    if is_new_episode:
+        stacked_frames = deque([processed] * frame_stack_size, maxlen=frame_stack_size)
+    else:
+        stacked_frames.append(processed)
+    return np.stack(stacked_frames, axis=0), stacked_frames
+
+# Q-Network
+def create_q_model():
+    return keras.Sequential([
+        layers.Input(shape=(frame_stack_size, 84, 84)),
+        layers.Lambda(lambda x: tf.cast(tf.transpose(x, [0, 2, 3, 1]), tf.float32)),
+        layers.Conv2D(32, 8, strides=4, activation="relu"),
+        layers.Conv2D(64, 4, strides=2, activation="relu"),
+        layers.Conv2D(64, 3, strides=1, activation="relu"),
+        layers.Flatten(),
+        layers.Dense(512, activation="relu"),
+        layers.Dense(num_actions, activation="linear"),
+    ])
+
+# Build models
+model = create_q_model()
+model_target = create_q_model()
+
+# Load checkpoint if exists
+weights_file = os.path.join(checkpoint_path, "model.weights.h5")
+target_weights_file = os.path.join(checkpoint_path, "model_target.weights.h5")
+
+episode_count = 0
+frame_count = 0
+running_reward = 0
+episode_reward_history = []
+best_recorded_reward = -float("inf")
+
+if os.path.exists(weights_file) and os.path.exists(target_weights_file):
+    model.load_weights(weights_file)
+    model_target.load_weights(target_weights_file)
+    print("✅ Model weights loaded successfully.")
+
+    if os.path.exists(metadata_path):
+        metadata = np.load(metadata_path, allow_pickle=True).item()
+        episode_count = metadata.get("episode", 0)
+        frame_count = metadata.get("frame", 0)
+        best_recorded_reward = metadata.get("best_reward", -float("inf"))
+        print(f"✅ Metadata loaded (Episode: {episode_count}, Frame: {frame_count})")
+    else:
+        print("⚠️ Metadata not found. Resuming with default counters.")
+else:
+    print("🚨 No valid checkpoint found. Starting training from scratch.")
+
+optimizer = keras.optimizers.Adam(learning_rate=0.00025, clipnorm=1.0)
+loss_function = keras.losses.Huber()
+
+# Training loop
+while True:
+    obs, _ = env.reset()
+    state_stack = None
+    state, state_stack = stack_frames(None, obs, True)
+    episode_reward = 0
+    episode_frames = []
+
+    for timestep in range(1, max_steps_per_episode + 1):
+        frame_count += 1
+
+        # Epsilon-greedy action
+        if frame_count < epsilon_random_frames or epsilon > np.random.rand():
+            action = np.random.choice(num_actions)
+        else:
+            state_tensor = tf.convert_to_tensor(np.expand_dims(state, axis=0))
+            action_probs = model(state_tensor, training=False)
+            action = tf.argmax(action_probs[0]).numpy()
+
+        # Decay epsilon
+        epsilon -= (1.0 - epsilon_min) / epsilon_decay
+        epsilon = max(epsilon, epsilon_min)
+
+        # Environment step
+        next_obs, reward, done, _, _ = env.step(action)
+        episode_frames.append(next_obs)
+        state_next, state_stack = stack_frames(state_stack, next_obs, False)
+        episode_reward += reward
+
+        # Save experience
+        state_history.append(state)
+        action_history.append(action)
+        rewards_history.append(reward)
+        done_history.append(done)
+        state_next_history.append(state_next)
+        state = state_next
+
+        # Train Q-network
+        if frame_count % update_after_actions == 0 and len(done_history) > batch_size:
+            indices = np.random.choice(len(done_history), batch_size, replace=False)
+            state_sample = np.array([state_history[i] for i in indices])
+            next_state_sample = np.array([state_next_history[i] for i in indices])
+            rewards_sample = np.array([rewards_history[i] for i in indices])
+            done_sample = np.array([done_history[i] for i in indices], dtype=np.float32)
+            action_sample = [action_history[i] for i in indices]
+
+            future_rewards = model_target.predict(next_state_sample, verbose=0)
+            max_future_q = np.max(future_rewards, axis=1)
+            updated_q_values = rewards_sample + gamma * max_future_q * (1 - done_sample)
+
+            masks = tf.one_hot(action_sample, num_actions)
+
+            with tf.GradientTape() as tape:
+                q_values = model(state_sample)
+                q_action = tf.reduce_sum(q_values * masks, axis=1)
+                loss = loss_function(updated_q_values, q_action)
+
+            grads = tape.gradient(loss, model.trainable_variables)
+            optimizer.apply_gradients(zip(grads, model.trainable_variables))
+
+        # Update target network and save
+        if frame_count % update_target_network == 0:
+            model_target.set_weights(model.get_weights())
+            model.save_weights(weights_file)
+            model_target.save_weights(target_weights_file)
+            np.save(metadata_path, {
+                "episode": episode_count,
+                "frame": frame_count,
+                "best_reward": best_recorded_reward
+            })
+            print(f"💾 Checkpoint saved (Frame: {frame_count}, Episode: {episode_count}, Avg Reward: {running_reward:.2f})")
+
+        if done:
+            break
+
+    # Update reward history
+    episode_reward_history.append(episode_reward)
+    if len(episode_reward_history) > 100:
+        episode_reward_history.pop(0)
+
+    running_reward = np.mean(episode_reward_history)
+    episode_count += 1
+
+    # Save best episode gameplay
+    if episode_reward > best_recorded_reward:
+        best_recorded_reward = episode_reward
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        video_path = os.path.join(recordings_path, f"episode_{episode_count}_reward_{episode_reward:.2f}_{timestamp}.mp4")
+        with imageio.get_writer(video_path, fps=30) as video:
+            for frame in episode_frames:
+                video.append_data(frame)
+        print(f"🎥 Saved BEST gameplay video: {video_path}")
+
+    print(f"Episode {episode_count} - Reward: {episode_reward}, Avg (last 100): {running_reward:.2f}, Epsilon: {epsilon:.4f}")
+
+    if running_reward > 40:
+        print(f"✅ Environment solved at episode {episode_count}!")
+        break
+
+    if episode_count >= max_episodes:
+        print("⚠️ Stopped training - max episodes reached.")
+        break
+
+env.close()
